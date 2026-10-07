@@ -19,6 +19,9 @@ from textual.widgets import (
     Select,
     Static,
 )
+from textual.worker import Worker
+
+import yaml
 
 from aiaddons.agents.manager import AgentDetectionManager
 from aiaddons.core.compatibility.engine import CompatibilityEngine
@@ -34,6 +37,7 @@ from aiaddons.core.installer.models import (
 )
 from aiaddons.core.models.agent import AgentCapability, AgentDetectionResult, Scope
 from aiaddons.core.models.manifest import IntegrationManifest, IntegrationType
+from aiaddons.core.models.stack import AddonStack
 from aiaddons.core.secrets.resolver import mask_secret_preview, validate_secret_format
 from aiaddons.core.update.engine import UpdateEngine, is_newer_version
 from aiaddons.core.update.models import UpdatePlan
@@ -59,6 +63,7 @@ class AIAddonsTUIApp(App[None]):
     BINDINGS = [
         Binding("h", "doctor", "Health Check"),
         Binding("s", "sync", "Sync Workspace"),
+        Binding("t", "cycle_category", "Category"),
         Binding("a", "cycle_agent", "Switch Agent"),
         Binding("o", "toggle_scope", "Toggle Scope"),
         Binding("i", "install", "Install"),
@@ -140,6 +145,16 @@ class AIAddonsTUIApp(App[None]):
         text-style: bold;
     }
 
+    #select-category {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    #addon-search {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
     #addon-list {
         height: 8;
         min-height: 4;
@@ -195,6 +210,12 @@ class AIAddonsTUIApp(App[None]):
         self.secret_inputs: dict[str, Input] = {}
         self.resolved_secrets: dict[str, str] = {}
         self._preview_token: int = 0
+        self._secret_counter: int = 0
+        self.stacks: dict[str, AddonStack] = {}
+        self.selected_stack: AddonStack | None = None
+        self.selected_stack_id: str | None = None
+        self.selected_category: str = "all"
+        self.search_query: str = ""
 
     @staticmethod
     def _default_registry_dir() -> Path | None:
@@ -205,6 +226,20 @@ class AIAddonsTUIApp(App[None]):
         with Container(id="main-container"):
             with VerticalScroll(id="sidebar"):
                 yield Label("Available Add-ons", classes="section-title")
+                yield Label("Category Filter [T]:", classes="config-label")
+                yield Select(
+                    [
+                        ("All Categories", "all"),
+                        ("MCP Servers", "mcp"),
+                        ("Agent Skills", "skill"),
+                        ("Composite Plugins", "plugin"),
+                        ("Stacks", "stack"),
+                    ],
+                    value="all",
+                    id="select-category",
+                    allow_blank=False,
+                )
+                yield Input(placeholder="Search add-ons...", id="addon-search")
                 yield ListView(id="addon-list")
                 yield Label("Target Configuration", classes="section-title")
                 yield Static(id="config-summary", content="Select an add-on to begin.")
@@ -248,7 +283,48 @@ class AIAddonsTUIApp(App[None]):
             yield Button("Update [U]", id="btn-update", variant="warning", disabled=True)
         yield Footer()
 
-    def on_mount(self) -> None:
+    def _find_stacks_dir(self) -> Path | None:
+        """Locate registry stacks directory."""
+        candidates: list[Path] = []
+        if self.registry_dir:
+            candidates.extend([
+                self.registry_dir / "stacks",
+                self.registry_dir.parent / "stacks",
+            ])
+        cwd = self.workspace_dir
+        candidates.extend([
+            cwd / "registry" / "stacks",
+            Path.cwd() / "registry" / "stacks",
+        ])
+        pkg_file = Path(__file__).resolve()
+        for parent in pkg_file.parents:
+            candidates.extend([parent / "registry" / "stacks", parent / "stacks"])
+        for cand in candidates:
+            if cand.exists() and cand.is_dir():
+                return cand
+        return None
+
+    def _load_stacks(self) -> None:
+        """Discover and load stacks from the registry stacks directory."""
+        self.stacks.clear()
+        stacks_dir = self._find_stacks_dir()
+        if not stacks_dir:
+            return
+        files = (
+            sorted(stacks_dir.glob("*.yaml"))
+            + sorted(stacks_dir.glob("*.yml"))
+            + sorted(stacks_dir.glob("*.json"))
+        )
+        for file_path in files:
+            try:
+                raw_dict = yaml.safe_load(file_path.read_text(encoding="utf-8"))
+                if isinstance(raw_dict, dict):
+                    stack = AddonStack.model_validate(raw_dict)
+                    self.stacks[file_path.stem] = stack
+            except Exception:
+                pass
+
+    async def on_mount(self) -> None:
         """Initialize registry and agent detection on app startup."""
         if self.registry_dir is not None and self.registry_dir.exists() and self.registry_dir.is_dir():
             self.registry, _ = Registry.from_directory(self.registry_dir)
@@ -257,6 +333,8 @@ class AIAddonsTUIApp(App[None]):
 
         if self.registry:
             self.manifests = self.registry.list()
+
+        self._load_stacks()
 
         manager = AgentDetectionManager()
         self.detected_agents = manager.detect_agents(project_path=self.workspace_dir)
@@ -294,13 +372,8 @@ class AIAddonsTUIApp(App[None]):
         scope_select = self.query_one("#select-scope", Select)
         scope_select.value = self.selected_scope.value
 
-        self._refresh_addon_list()
+        await self._do_refresh_addon_list()
         self._update_config_summary()
-        if self.manifests and self.selected_manifest is None:
-            self.selected_manifest = self.manifests[0]
-            list_view = self.query_one("#addon-list", ListView)
-            list_view.index = 0
-            self._update_details_view()
 
     def _get_addon_installed_record(self, addon_id: str) -> InstalledAddonRecord | None:
         """Look up the installed record for an add-on in the state store."""
@@ -312,6 +385,27 @@ class AIAddonsTUIApp(App[None]):
             scope=self.selected_scope,
             addon_id=addon_id,
         )
+
+    def _get_stack_status(self, stack: AddonStack) -> tuple[int, int]:
+        """Return (installed_count, total_count) for add-ons in the stack."""
+        total = len(stack.addons)
+        installed = 0
+        for entry in stack.addons:
+            addon_id = entry if isinstance(entry, str) else entry.id
+            rec = self._get_addon_installed_record(addon_id)
+            if rec is not None:
+                installed += 1
+            elif self.selected_scope == Scope.WORKSPACE and self.selected_agent:
+                lockfile_mgr = LockfileManager()
+                entries = lockfile_mgr.get_entries(self.workspace_dir)
+                for lent in entries:
+                    if (
+                        lent.addon_id.strip().lower() == addon_id.strip().lower()
+                        and lent.target_agent.strip().lower() == self.selected_agent.agent_id.strip().lower()
+                    ):
+                        installed += 1
+                        break
+        return installed, total
 
     def _get_installation_status(self, manifest: IntegrationManifest) -> tuple[bool, str, str | None]:
         """Return (is_installed, installed_version, newer_version_or_None)."""
@@ -338,12 +432,41 @@ class AIAddonsTUIApp(App[None]):
 
         return False, "", None
 
-    def _refresh_addon_list(self) -> None:
+    async def _do_refresh_addon_list(self) -> None:
         """Populate or refresh the Addon ListView with installation status badges."""
         list_view = self.query_one("#addon-list", ListView)
+        await list_view.clear()
 
-        if not list_view.children:
+        prev_id: str | None = None
+        if self.selected_manifest:
+            prev_id = f"item-{self.selected_manifest.id}"
+        elif self.selected_stack_id:
+            prev_id = f"item-stack-{self.selected_stack_id}"
+
+        items_to_add: list[ListItem] = []
+        new_selected_index: int | None = None
+
+        query = self.search_query.strip().lower()
+        cat = self.selected_category
+
+        # 1. Filter manifests
+        if cat in ("all", "mcp", "skill", "plugin"):
             for m in self.manifests:
+                if cat != "all":
+                    if m.integration_type.value != cat:
+                        continue
+
+                if query:
+                    m_tags = [t.lower() for t in (m.tags or [])]
+                    match = (
+                        query in m.id.lower()
+                        or query in m.name.lower()
+                        or query in (m.description or "").lower()
+                        or any(query in t for t in m_tags)
+                    )
+                    if not match:
+                        continue
+
                 is_inst, curr_v, newer_v = self._get_installation_status(m)
                 if is_inst and newer_v:
                     badge = f"[bold yellow](Update: v{curr_v}->v{newer_v})[/bold yellow]"
@@ -352,24 +475,67 @@ class AIAddonsTUIApp(App[None]):
                 else:
                     badge = "[dim](Available)[/dim]"
 
-                label_str = f"{m.name} ({m.id}) {badge}"
-                list_view.append(ListItem(Label(label_str), id=f"item-{m.id}"))
+                type_badge = f"[{m.integration_type.value.upper()}]"
+                label_str = f"{type_badge} {m.name} ({m.id}) {badge}"
+                item_widget_id = f"item-{m.id}"
+                items_to_add.append(ListItem(Label(label_str), id=item_widget_id))
+
+        # 2. Filter stacks
+        if cat in ("all", "stack"):
+            for sid, stack in self.stacks.items():
+                if query:
+                    match = (
+                        query in sid.lower()
+                        or query in (stack.name or "").lower()
+                        or query in (stack.description or "").lower()
+                    )
+                    if not match:
+                        continue
+
+                inst_count, total_count = self._get_stack_status(stack)
+                if inst_count == total_count and total_count > 0:
+                    badge = f"[bold green](Installed: {inst_count}/{total_count})[/bold green]"
+                elif inst_count > 0:
+                    badge = f"[bold yellow](Partial: {inst_count}/{total_count})[/bold yellow]"
+                else:
+                    badge = f"[dim](Available: {total_count} items)[/dim]"
+
+                stack_name = stack.name or sid
+                label_str = f"[STACK] {stack_name} ({sid}) {badge}"
+                item_widget_id = f"item-stack-{sid}"
+                items_to_add.append(ListItem(Label(label_str), id=item_widget_id))
+
+        for idx, itm in enumerate(items_to_add):
+            list_view.append(itm)
+            if prev_id and itm.id == prev_id:
+                new_selected_index = idx
+
+        if items_to_add:
+            if new_selected_index is not None:
+                list_view.index = new_selected_index
+                self._update_details_view()
+            else:
+                list_view.index = 0
+                first_item = items_to_add[0]
+                if first_item.id:
+                    if first_item.id.startswith("item-stack-"):
+                        self._select_stack(first_item.id[len("item-stack-"):])
+                    else:
+                        self._select_addon(first_item.id[len("item-"):])
         else:
-            for m in self.manifests:
-                is_inst, curr_v, newer_v = self._get_installation_status(m)
-                if is_inst and newer_v:
-                    badge = f"[bold yellow](Update: v{curr_v}->v{newer_v})[/bold yellow]"
-                elif is_inst:
-                    badge = f"[bold green](Installed v{curr_v})[/bold green]"
-                else:
-                    badge = "[dim](Available)[/dim]"
+            self.selected_manifest = None
+            self.selected_stack = None
+            self.selected_stack_id = None
+            self._preview_token += 1
+            self._update_details_view()
 
-                label_str = f"{m.name} ({m.id}) {badge}"
-                try:
-                    item = list_view.query_one(f"#item-{m.id}", ListItem)
-                    item.query_one(Label).update(label_str)
-                except Exception:
-                    pass
+    def _refresh_addon_list(self) -> Worker[None]:
+        """Schedule list refresh worker with exclusive lock."""
+        return self.run_worker(
+            self._do_refresh_addon_list(),
+            group="refresh_addon_list",
+            exclusive=True,
+        )
 
     def _update_config_summary(self) -> None:
         summary_widget = self.query_one("#config-summary", Static)
@@ -396,9 +562,11 @@ class AIAddonsTUIApp(App[None]):
         manifest = self.registry.get(addon_id)
         if not manifest:
             return
-        if self.selected_manifest and self.selected_manifest.id == manifest.id:
+        if self.selected_manifest and self.selected_manifest.id == manifest.id and self.selected_stack is None:
             return
         self.selected_manifest = manifest
+        self.selected_stack = None
+        self.selected_stack_id = None
         self._preview_token += 1
         try:
             list_view = self.query_one("#addon-list", ListView)
@@ -411,19 +579,49 @@ class AIAddonsTUIApp(App[None]):
             pass
         self._update_details_view()
 
+    def _select_stack(self, stack_id: str) -> None:
+        """Select a stack, synchronize preview token, and refresh details view."""
+        if stack_id not in self.stacks:
+            return
+        stack = self.stacks[stack_id]
+        if self.selected_stack and self.selected_stack_id == stack_id and self.selected_manifest is None:
+            return
+        self.selected_stack = stack
+        self.selected_stack_id = stack_id
+        self.selected_manifest = None
+        self._preview_token += 1
+        try:
+            list_view = self.query_one("#addon-list", ListView)
+            for idx, child in enumerate(list_view.children):
+                if child.id == f"item-stack-{stack_id}":
+                    if list_view.index != idx:
+                        list_view.index = idx
+                    break
+        except Exception:
+            pass
+        self._update_details_view()
+
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         """Handle highlight changes (keyboard navigation / cursor movement)."""
         if not event.item or not event.item.id:
             return
-        addon_id = event.item.id.replace("item-", "")
-        self._select_addon(addon_id)
+        if event.item.id.startswith("item-stack-"):
+            stack_id = event.item.id[len("item-stack-"):]
+            self._select_stack(stack_id)
+        else:
+            addon_id = event.item.id.replace("item-", "")
+            self._select_addon(addon_id)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Handle explicit selection of an add-on item from the list."""
         if not event.item or not event.item.id:
             return
-        addon_id = event.item.id.replace("item-", "")
-        self._select_addon(addon_id)
+        if event.item.id.startswith("item-stack-"):
+            stack_id = event.item.id[len("item-stack-"):]
+            self._select_stack(stack_id)
+        else:
+            addon_id = event.item.id.replace("item-", "")
+            self._select_addon(addon_id)
 
     def _update_details_view(self) -> None:
         detail_view = self.query_one("#detail-view", Markdown)
@@ -435,8 +633,67 @@ class AIAddonsTUIApp(App[None]):
         remove_btn.disabled = True
         update_btn.disabled = True
 
+        if self.selected_stack:
+            stack = self.selected_stack
+            sid = self.selected_stack_id or "stack"
+            inst_count, total_count = self._get_stack_status(stack)
+
+            md_text = f"## Stack: {stack.name or sid} (`{sid}`)\n\n"
+            md_text += f"**Bundle Version:** {stack.version or '1.0'} | **Total Add-ons:** {total_count}\n\n"
+            if stack.description:
+                md_text += f"{stack.description}\n\n"
+
+            if inst_count == total_count and total_count > 0:
+                md_text += f"**Installation Status:** ✅ **Fully Installed** ({inst_count}/{total_count})\n\n"
+            elif inst_count > 0:
+                md_text += f"**Installation Status:** ⚠️ **Partially Installed** ({inst_count}/{total_count})\n\n"
+                confirm_btn.disabled = False
+            else:
+                md_text += f"**Installation Status:** ⚪ **Not Installed** (0/{total_count})\n\n"
+                confirm_btn.disabled = False
+
+            md_text += "### Bundled Add-ons:\n"
+            all_compat = True
+            incompat_reasons: list[str] = []
+
+            for entry in stack.addons:
+                addon_id = entry if isinstance(entry, str) else entry.id
+                pinned_v = None if isinstance(entry, str) else entry.version
+                m = self.registry.get(addon_id) if self.registry else None
+                rec = self._get_addon_installed_record(addon_id)
+                status_icon = "✅ Installed" if rec else "⚪ Not Installed"
+                ver_str = f"v{pinned_v}" if pinned_v else "latest"
+                addon_title = m.name if m else addon_id
+                md_text += f"- **{addon_title}** (`{addon_id}`) [{ver_str}] — {status_icon}\n"
+
+                if m and self.selected_agent:
+                    compat_engine = CompatibilityEngine(registry=self.registry)
+                    cres = compat_engine.evaluate(m, self.selected_agent, self.selected_scope, registry=self.registry)
+                    if not cres.compatible:
+                        all_compat = False
+                        incompat_reasons.extend([f"{addon_id}: {r}" for r in cres.reasons])
+                elif not self.selected_agent:
+                    all_compat = False
+
+            if self.selected_agent:
+                if all_compat:
+                    md_text += f"\n### Compatibility: ✅ All add-ons compatible with {self.selected_agent.name}\n"
+                else:
+                    md_text += f"\n### Compatibility: ❌ Incompatible add-ons with {self.selected_agent.name}\n"
+                    for r in incompat_reasons:
+                        md_text += f"- {r}\n"
+                    confirm_btn.disabled = True
+            else:
+                md_text += "\n### Compatibility: ⚠️ No AI Agent Detected\n"
+                confirm_btn.disabled = True
+
+            detail_view.update(md_text)
+            self._prepare_secrets_ui()
+            return
+
         if not self.selected_manifest:
             detail_view.update("No add-on selected.")
+            self._prepare_secrets_ui()
             return
 
         m = self.selected_manifest
@@ -488,28 +745,38 @@ class AIAddonsTUIApp(App[None]):
         container = self.query_one("#secrets-container", Vertical)
         container.remove_children()
 
-        if not self.selected_manifest or not self.selected_manifest.handler_spec.mcp:
+        manifests_to_check: list[IntegrationManifest] = []
+        if self.selected_stack and self.registry:
+            for entry in self.selected_stack.addons:
+                aid = entry if isinstance(entry, str) else entry.id
+                m = self.registry.get(aid)
+                if m:
+                    manifests_to_check.append(m)
+        elif self.selected_manifest:
+            manifests_to_check.append(self.selected_manifest)
+
+        required_vars_all: list[tuple[str, Any, str]] = []
+        for m in manifests_to_check:
+            if m.handler_spec.mcp and m.handler_spec.mcp.env_vars:
+                for v in m.handler_spec.mcp.env_vars:
+                    if v.required:
+                        required_vars_all.append((v.name, v, m.name))
+
+        if not required_vars_all:
             return
 
-        env_vars = self.selected_manifest.handler_spec.mcp.env_vars
-        if not env_vars:
-            return
-
-        required_vars = [v for v in env_vars if v.required]
-        if not required_vars:
-            return
-
+        self._secret_counter += 1
         container.mount(Label("Required Secrets Input", classes="section-title"))
-        for spec in required_vars:
-            lbl = Label(f"{spec.name} ({spec.description or 'Required secret'}):")
+        for name, spec, addon_name in required_vars_all:
+            lbl = Label(f"{name} ({addon_name} - {spec.description or 'Required secret'}):")
             inp = Input(
-                placeholder=f"Enter {spec.name}",
+                placeholder=f"Enter {name}",
                 password=True,
-                id=f"sec-{spec.name}-{self._preview_token}",
+                id=f"sec-{name}-{self._secret_counter}",
             )
             container.mount(lbl)
             container.mount(inp)
-            self.secret_inputs[spec.name] = inp
+            self.secret_inputs[name] = inp
 
     # -------------------------------------------------------------------------
     # Keybinding & Button Actions
@@ -566,8 +833,20 @@ class AIAddonsTUIApp(App[None]):
 
         self.notify(f"Scope switched to {self.selected_scope.value.capitalize()}", severity="information")
 
+    def action_cycle_category(self) -> None:
+        """Cycle through category filters."""
+        categories = ["all", "mcp", "skill", "plugin", "stack"]
+        if self.selected_category in categories:
+            curr_idx = categories.index(self.selected_category)
+            next_idx = (curr_idx + 1) % len(categories)
+        else:
+            next_idx = 0
+        next_cat = categories[next_idx]
+        cat_select = self.query_one("#select-category", Select)
+        cat_select.value = next_cat
+
     def on_select_changed(self, event: Select.Changed) -> None:
-        """Handle user selection from target agent and scope dropdowns."""
+        """Handle user selection from target agent, scope, and category dropdowns."""
         if event.control.id == "select-agent":
             if event.value != Select.BLANK and event.value is not None:
                 agent_id = str(event.value)
@@ -588,6 +867,26 @@ class AIAddonsTUIApp(App[None]):
                         self.notify(f"Scope switched to {self.selected_scope.value.capitalize()}", severity="information")
                 except ValueError:
                     pass
+        elif event.control.id == "select-category":
+            if event.value != Select.BLANK and event.value is not None:
+                new_cat = str(event.value)
+                if self.selected_category != new_cat:
+                    self.selected_category = new_cat
+                    self._refresh_addon_list()
+                    cat_name = dict(
+                        all="All Categories",
+                        mcp="MCP Servers",
+                        skill="Agent Skills",
+                        plugin="Composite Plugins",
+                        stack="Stacks",
+                    ).get(new_cat, new_cat)
+                    self.notify(f"Filtered by: {cat_name}", severity="information")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Handle live search filtering in the add-on search bar."""
+        if event.input.id == "addon-search":
+            self.search_query = event.value.strip().lower()
+            self._refresh_addon_list()
 
     def action_install(self) -> None:
         """Trigger add-on installation."""
@@ -599,10 +898,16 @@ class AIAddonsTUIApp(App[None]):
 
     def action_remove(self) -> None:
         """Trigger add-on removal with drift detection."""
+        if self.selected_stack:
+            self.notify("Please select an individual add-on to remove it.", severity="warning")
+            return
         self._initiate_removal()
 
     def action_update(self) -> None:
         """Trigger add-on version update with dry-run preview."""
+        if self.selected_stack:
+            self.notify("Please select an individual add-on to update it.", severity="warning")
+            return
         self._initiate_update()
 
     def action_check_compat(self) -> None:
@@ -636,8 +941,44 @@ class AIAddonsTUIApp(App[None]):
     # Compatibility & Plan Preview
     # -------------------------------------------------------------------------
     def _run_compatibility_check(self) -> None:
-        if not self.selected_manifest or not self.selected_agent:
+        if not self.selected_agent:
             return
+
+        detail_view = self.query_one("#detail-view", Markdown)
+
+        if self.selected_stack and self.registry:
+            target_stack = self.selected_stack
+            compat_engine = CompatibilityEngine(registry=self.registry)
+            manifests: list[IntegrationManifest] = []
+            for entry in target_stack.addons:
+                aid = entry if isinstance(entry, str) else entry.id
+                m = self.registry.get(aid)
+                if m:
+                    manifests.append(m)
+
+            results = compat_engine.evaluate_batch(
+                manifests=manifests, agent=self.selected_agent, scope=self.selected_scope, registry=self.registry
+            )
+            all_compat = all(r.compatible for r in results)
+            status_sym = "✅" if all_compat else "❌"
+            is_comp = "Compatible" if all_compat else "Incompatible"
+
+            md = f"## Stack Compatibility Result\n\n"
+            md += f"**Stack:** {target_stack.name or self.selected_stack_id}\n"
+            md += f"**Agent:** {self.selected_agent.name}\n"
+            md += f"**Status:** {status_sym} {is_comp}\n\n"
+            for m, r in zip(manifests, results):
+                r_sym = "✅" if r.compatible else "❌"
+                md += f"### {r_sym} {m.name} (`{m.id}`)\n"
+                for reason in r.reasons:
+                    md += f"- {reason}\n"
+            detail_view.update(md)
+            self.notify(f"Stack compatibility: {is_comp}", severity="information" if all_compat else "warning")
+            return
+
+        if not self.selected_manifest:
+            return
+
         compat_engine = CompatibilityEngine(registry=self.registry)
         compat = compat_engine.evaluate(
             self.selected_manifest,
@@ -645,7 +986,6 @@ class AIAddonsTUIApp(App[None]):
             self.selected_scope,
             registry=self.registry,
         )
-        detail_view = self.query_one("#detail-view", Markdown)
 
         status_sym = "✅" if compat.compatible else "❌"
         is_comp = "Compatible" if compat.compatible else "Incompatible"
@@ -659,12 +999,52 @@ class AIAddonsTUIApp(App[None]):
         self.notify(f"Compatibility check: {is_comp}", severity="information" if compat.compatible else "warning")
 
     def _run_plan_preview(self) -> None:
-        if not self.selected_manifest or not self.selected_agent or not self.registry:
+        if not self.selected_agent or not self.registry:
             return
         token = self._preview_token
-        target_manifest = self.selected_manifest
         target_agent = self.selected_agent
         target_scope = self.selected_scope
+
+        if self.selected_stack:
+            target_stack = self.selected_stack
+            target_stack_id = self.selected_stack_id
+            inst_engine = InstallationEngine(registry=self.registry)
+            try:
+                manifests: list[IntegrationManifest] = []
+                for entry in target_stack.addons:
+                    aid = entry if isinstance(entry, str) else entry.id
+                    m = self.registry.get(aid)
+                    if m:
+                        manifests.append(m)
+                batch_plan = inst_engine.generate_batch_plan(
+                    manifests=manifests, agent=target_agent, scope=target_scope, registry=self.registry
+                )
+                if token != self._preview_token or self.selected_stack != target_stack:
+                    return
+                detail_view = self.query_one("#detail-view", Markdown)
+                md = f"## Batch Plan Preview for Stack: {target_stack.name or target_stack_id}\n\n"
+                md += f"**Target Agent:** {target_agent.name}\n"
+                md += f"**Scope:** {target_scope.value}\n\n"
+                md += f"### Add-ons in Batch ({len(batch_plan.plans)}):\n"
+                for p in batch_plan.plans:
+                    md += f"#### {p.addon_name} (`{p.addon_id}`)\n"
+                    for op in p.planned_operations:
+                        md += f"- ✓ {op.description}\n"
+                md += "\n*No changes were made to host system state.*\n"
+                detail_view.update(md)
+                self.notify(f"Generated dry-run batch plan for stack '{target_stack.name}'.", severity="information")
+            except Exception as exc:
+                if token != self._preview_token or self.selected_stack != target_stack:
+                    return
+                detail_view = self.query_one("#detail-view", Markdown)
+                detail_view.update(f"## Stack Plan Preview Error\n\n❌ {exc}")
+                self.notify(f"Plan error: {exc}", severity="error")
+            return
+
+        if not self.selected_manifest:
+            return
+
+        target_manifest = self.selected_manifest
         inst_engine = InstallationEngine(registry=self.registry)
         try:
             plan = inst_engine.generate_plan(
@@ -696,13 +1076,102 @@ class AIAddonsTUIApp(App[None]):
     # -------------------------------------------------------------------------
     def _execute_real_installation(self, force_secrets: bool = False) -> None:
         """Delegate installation execution directly to core ExecutionEngine & VerificationEngine."""
-        if not self.selected_manifest or not self.selected_agent or not self.registry:
+        if not self.selected_agent or not self.registry:
             return
 
         detail_view = self.query_one("#detail-view", Markdown)
 
-        # Collect secrets from hidden input fields with masked confirmation
-        secret_map: dict[str, str] = {}
+        # 1. Stack installation flow
+        if self.selected_stack:
+            target_stack = self.selected_stack
+            manifests: list[IntegrationManifest] = []
+            for entry in target_stack.addons:
+                aid = entry if isinstance(entry, str) else entry.id
+                m = self.registry.get(aid)
+                if m:
+                    manifests.append(m)
+
+            secret_map: dict[str, str] = {}
+            for m in manifests:
+                if m.handler_spec.mcp and m.handler_spec.mcp.env_vars:
+                    for req_spec in m.handler_spec.mcp.env_vars:
+                        if req_spec.required:
+                            inp = self.secret_inputs.get(req_spec.name)
+                            val = inp.value.strip() if inp else ""
+                            if not val:
+                                detail_view.update(
+                                    f"## Installation Error\n\n❌ Secret '{req_spec.name}' is required for {m.name}.\n\n"
+                                    "No value was entered — please fill in the field and try again."
+                                )
+                                self.notify(f"Secret '{req_spec.name}' is required. No value was entered.", severity="error")
+                                return
+                            secret_map[req_spec.name] = val
+
+            wal_mgr = TransactionWALManager(transactions_dir=self.store_dir / "transactions")
+            state_store = InstalledStateStore(store_dir=self.store_dir)
+            lockfile_mgr = LockfileManager()
+            inst_engine = InstallationEngine(registry=self.registry, wal_manager=wal_mgr)
+            execution_engine = ExecutionEngine(
+                wal_manager=wal_mgr,
+                state_store=state_store,
+                lockfile_manager=lockfile_mgr,
+                registry=self.registry,
+                workspace_dir=self.workspace_dir,
+            )
+
+            try:
+                tx = inst_engine.create_batch_transaction(
+                    manifests=manifests, agent=self.selected_agent, scope=self.selected_scope, registry=self.registry
+                )
+                if not tx.batch_plan or tx.phase == TransactionPhase.FAILED:
+                    detail_view.update(f"## Planning Error\n\n❌ {tx.error_message}")
+                    self.notify(f"Planning error: {tx.error_message}", severity="error")
+                    return
+
+                batch_plan = tx.batch_plan
+                tx.phase = TransactionPhase.REVIEWED
+                tx.phase = TransactionPhase.EXECUTING
+
+                res = execution_engine.execute_batch_plan(
+                    batch_plan=batch_plan,
+                    transaction=tx,
+                    dry_run=False,
+                    secret_values=secret_map,
+                    registry=self.registry,
+                    workspace_dir=self.workspace_dir,
+                )
+
+                if res.status == ExecutionStatus.SUCCESS:
+                    tx.phase = TransactionPhase.COMMITTED
+                    md = "## Stack Installation Successful! 🎉\n\n"
+                    md += f"**Stack:** {target_stack.name or self.selected_stack_id}\n"
+                    md += f"**Agent:** {self.selected_agent.name}\n"
+                    md += f"**Scope:** {self.selected_scope.value}\n\n"
+                    md += f"### Installed Add-ons ({len(manifests)}):\n"
+                    for m in manifests:
+                        md += f"- ✓ {m.name} (`{m.id}`)\n"
+                    detail_view.update(md)
+                    self.notify(f"Successfully installed stack '{target_stack.name}'!", severity="information")
+                    self._refresh_addon_list()
+                    self._update_details_view()
+                else:
+                    tx.phase = TransactionPhase.ROLLED_BACK
+                    raw_err = res.error_message or "Batch execution failed"
+                    err_msg = mask_secrets_in_text(raw_err, list(secret_map.values()))
+                    md = f"## Batch Installation Failed ❌\n\n**Error:** {err_msg}"
+                    detail_view.update(md)
+                    self.notify(f"Batch installation failed: {err_msg}", severity="error")
+            except Exception as exc:
+                err_msg = mask_secrets_in_text(str(exc), list(secret_map.values()))
+                detail_view.update(f"## Installation Error\n\n❌ {err_msg}")
+                self.notify(f"Installation error: {err_msg}", severity="error")
+            return
+
+        # 2. Single add-on installation flow
+        if not self.selected_manifest:
+            return
+
+        secret_map = {}
         all_warnings: list[str] = []
 
         mcp_spec = self.selected_manifest.handler_spec.mcp

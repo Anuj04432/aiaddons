@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from textual.widgets import ListView, Markdown, Button
+from textual.widgets import Button, Input, ListView, Markdown, Select
 
 from aiaddons.core.installer.engine import InstallationEngine
 from aiaddons.core.models.agent import AgentCapability, AgentDetectionResult, Scope
@@ -289,3 +289,171 @@ def test_tui_artificially_delayed_preview_race_condition(tmp_path: Path) -> None
                 assert app.current_plan.addon_id == "context7-mcp"
 
     asyncio.run(_run())
+
+
+def test_tui_category_separation_and_agent_scope_persistence(tmp_path: Path) -> None:
+    """Verify switching categories preserves agent and scope selections,
+
+    and filters the list view appropriately.
+    """
+    async def _run() -> None:
+        reg_dir, store_dir, workspace_dir, agent = _create_regression_registry(tmp_path)
+        # Create a sample stack
+        stacks_dir = reg_dir / "stacks"
+        stacks_dir.mkdir(parents=True, exist_ok=True)
+        (stacks_dir / "test-stack.yaml").write_text(
+            "name: Test Stack\ndescription: Test stack bundle\naddons:\n  - brave-search-mcp\n  - caveman\n",
+            encoding="utf-8",
+        )
+
+        with patch("aiaddons.tui.app.AgentDetectionManager.detect_agents", return_value={"claude-code": agent}):
+            app = AIAddonsTUIApp(registry_dir=reg_dir, workspace_dir=workspace_dir, store_dir=store_dir)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                lv = app.query_one("#addon-list", ListView)
+                cat_select = app.query_one("#select-category", Select)
+                agent_select = app.query_one("#select-agent", Select)
+                scope_select = app.query_one("#select-scope", Select)
+
+                # Set custom scope
+                app.action_toggle_scope()
+                await pilot.pause(0.05)
+                assert app.selected_scope == Scope.GLOBAL
+                assert scope_select.value == "global"
+                assert agent_select.value == "claude-code"
+
+                # 1. Switch category to 'skill'
+                cat_select.value = "skill"
+                await pilot.pause(0.05)
+                assert app.selected_category == "skill"
+                # Agent and scope MUST be preserved
+                assert app.selected_scope == Scope.GLOBAL
+                assert scope_select.value == "global"
+                assert agent_select.value == "claude-code"
+                # ListView should contain only skill items
+                item_ids = [c.id for c in lv.children]
+                assert item_ids == ["item-caveman"]
+                assert app.selected_manifest.id == "caveman"
+
+                # 2. Switch category to 'mcp'
+                cat_select.value = "mcp"
+                await pilot.pause(0.05)
+                assert app.selected_category == "mcp"
+                assert app.selected_scope == Scope.GLOBAL
+                assert scope_select.value == "global"
+                assert agent_select.value == "claude-code"
+                mcp_ids = [c.id for c in lv.children]
+                assert "item-brave-search-mcp" in mcp_ids
+                assert "item-context7-mcp" in mcp_ids
+                assert "item-caveman" not in mcp_ids
+
+                # 3. Switch category to 'stack'
+                cat_select.value = "stack"
+                await pilot.pause(0.05)
+                assert app.selected_category == "stack"
+                assert app.selected_scope == Scope.GLOBAL
+                assert scope_select.value == "global"
+                stack_ids = [c.id for c in lv.children]
+                assert stack_ids == ["item-stack-test-stack"]
+                assert app.selected_stack is not None
+                assert app.selected_stack_id == "test-stack"
+
+                # 4. Cycle category with keybinding action_cycle_category
+                app.action_cycle_category()  # from stack -> all
+                await pilot.pause(0.05)
+                assert app.selected_category == "all"
+                assert app.selected_scope == Scope.GLOBAL
+                assert scope_select.value == "global"
+                assert len(lv.children) == 4  # 3 manifests + 1 stack
+
+    asyncio.run(_run())
+
+
+def test_tui_category_search_and_plan_preview_isolation(tmp_path: Path) -> None:
+    """Verify search within category filters correctly and selecting an add-on
+
+    in a filtered category generates the correct plan preview without cross-addon contamination.
+    """
+    async def _run() -> None:
+        reg_dir, store_dir, workspace_dir, agent = _create_regression_registry(tmp_path)
+        with patch("aiaddons.tui.app.AgentDetectionManager.detect_agents", return_value={"claude-code": agent}):
+            app = AIAddonsTUIApp(registry_dir=reg_dir, workspace_dir=workspace_dir, store_dir=store_dir)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                lv = app.query_one("#addon-list", ListView)
+                search_inp = app.query_one("#addon-search", Input)
+                cat_select = app.query_one("#select-category", Select)
+                dv = app.query_one("#detail-view", Markdown)
+
+                # Filter by MCP category first
+                cat_select.value = "mcp"
+                await pilot.pause(0.05)
+
+                # Search for "context"
+                search_inp.value = "context"
+                await pilot.pause(0.05)
+
+                # Only context7-mcp should remain
+                item_ids = [c.id for c in lv.children]
+                assert item_ids == ["item-context7-mcp"]
+                assert app.selected_manifest.id == "context7-mcp"
+                assert len(app.secret_inputs) == 0
+
+                # Preview plan for context7-mcp
+                app.action_preview_plan()
+                await pilot.pause(0.05)
+                assert app.current_plan is not None
+                assert app.current_plan.addon_id == "context7-mcp"
+                assert "BRAVE_API_KEY" not in dv._markdown
+
+                # Search for "brave"
+                search_inp.value = "brave"
+                await pilot.pause(0.05)
+
+                item_ids = [c.id for c in lv.children]
+                assert item_ids == ["item-brave-search-mcp"]
+                assert app.selected_manifest.id == "brave-search-mcp"
+                assert "BRAVE_API_KEY" in app.secret_inputs
+
+                # Clear search
+                search_inp.value = ""
+                await pilot.pause(0.05)
+                assert len(lv.children) == 2
+
+    asyncio.run(_run())
+
+
+def test_tui_stack_category_batch_plan_preview(tmp_path: Path) -> None:
+    """Verify selecting a stack renders stack details and previews batch plan operations."""
+    async def _run() -> None:
+        reg_dir, store_dir, workspace_dir, agent = _create_regression_registry(tmp_path)
+        stacks_dir = reg_dir / "stacks"
+        stacks_dir.mkdir(parents=True, exist_ok=True)
+        (stacks_dir / "dev-stack.yaml").write_text(
+            "name: Dev Stack\ndescription: Starter bundle\naddons:\n  - context7-mcp\n  - caveman\n",
+            encoding="utf-8",
+        )
+
+        with patch("aiaddons.tui.app.AgentDetectionManager.detect_agents", return_value={"claude-code": agent}):
+            app = AIAddonsTUIApp(registry_dir=reg_dir, workspace_dir=workspace_dir, store_dir=store_dir)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                cat_select = app.query_one("#select-category", Select)
+                dv = app.query_one("#detail-view", Markdown)
+
+                cat_select.value = "stack"
+                await pilot.pause()
+
+                assert app.selected_stack is not None
+                assert app.selected_stack.name == "Dev Stack"
+                assert "Dev Stack" in dv._markdown
+
+                # Preview batch plan for stack
+                app.action_preview_plan()
+                await pilot.pause()
+                assert "Batch Plan Preview for Stack: Dev Stack" in dv._markdown
+                assert "context7-mcp" in dv._markdown
+                assert "caveman" in dv._markdown
+
+    asyncio.run(_run())
+
