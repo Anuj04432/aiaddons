@@ -194,6 +194,7 @@ class AIAddonsTUIApp(App[None]):
         self.current_tx: InstallationTransaction | None = None
         self.secret_inputs: dict[str, Input] = {}
         self.resolved_secrets: dict[str, str] = {}
+        self._preview_token: int = 0
 
     @staticmethod
     def _default_registry_dir() -> Path | None:
@@ -295,6 +296,11 @@ class AIAddonsTUIApp(App[None]):
 
         self._refresh_addon_list()
         self._update_config_summary()
+        if self.manifests and self.selected_manifest is None:
+            self.selected_manifest = self.manifests[0]
+            list_view = self.query_one("#addon-list", ListView)
+            list_view.index = 0
+            self._update_details_view()
 
     def _get_addon_installed_record(self, addon_id: str) -> InstalledAddonRecord | None:
         """Look up the installed record for an add-on in the state store."""
@@ -383,14 +389,41 @@ class AIAddonsTUIApp(App[None]):
         self._refresh_addon_list()
         self._update_details_view()
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        """Handle selection of an add-on item from the list."""
+    def _select_addon(self, addon_id: str) -> None:
+        """Select an add-on, synchronize preview token, and refresh details view."""
+        if not self.registry:
+            return
+        manifest = self.registry.get(addon_id)
+        if not manifest:
+            return
+        if self.selected_manifest and self.selected_manifest.id == manifest.id:
+            return
+        self.selected_manifest = manifest
+        self._preview_token += 1
+        try:
+            list_view = self.query_one("#addon-list", ListView)
+            for idx, child in enumerate(list_view.children):
+                if child.id == f"item-{addon_id}":
+                    if list_view.index != idx:
+                        list_view.index = idx
+                    break
+        except Exception:
+            pass
+        self._update_details_view()
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        """Handle highlight changes (keyboard navigation / cursor movement)."""
         if not event.item or not event.item.id:
             return
         addon_id = event.item.id.replace("item-", "")
-        if self.registry:
-            self.selected_manifest = self.registry.get(addon_id)
-            self._update_details_view()
+        self._select_addon(addon_id)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Handle explicit selection of an add-on item from the list."""
+        if not event.item or not event.item.id:
+            return
+        addon_id = event.item.id.replace("item-", "")
+        self._select_addon(addon_id)
 
     def _update_details_view(self) -> None:
         detail_view = self.query_one("#detail-view", Markdown)
@@ -451,6 +484,7 @@ class AIAddonsTUIApp(App[None]):
         self._prepare_secrets_ui()
 
     def _prepare_secrets_ui(self) -> None:
+        self.secret_inputs.clear()
         container = self.query_one("#secrets-container", Vertical)
         container.remove_children()
 
@@ -466,10 +500,13 @@ class AIAddonsTUIApp(App[None]):
             return
 
         container.mount(Label("Required Secrets Input", classes="section-title"))
-        self.secret_inputs.clear()
         for spec in required_vars:
             lbl = Label(f"{spec.name} ({spec.description or 'Required secret'}):")
-            inp = Input(placeholder=f"Enter {spec.name}", password=True, id=f"sec-{spec.name}")
+            inp = Input(
+                placeholder=f"Enter {spec.name}",
+                password=True,
+                id=f"sec-{spec.name}-{self._preview_token}",
+            )
             container.mount(lbl)
             container.mount(inp)
             self.secret_inputs[spec.name] = inp
@@ -624,24 +661,32 @@ class AIAddonsTUIApp(App[None]):
     def _run_plan_preview(self) -> None:
         if not self.selected_manifest or not self.selected_agent or not self.registry:
             return
+        token = self._preview_token
+        target_manifest = self.selected_manifest
+        target_agent = self.selected_agent
+        target_scope = self.selected_scope
         inst_engine = InstallationEngine(registry=self.registry)
         try:
             plan = inst_engine.generate_plan(
-                self.selected_manifest, self.selected_agent, self.selected_scope
+                target_manifest, target_agent, target_scope
             )
+            if token != self._preview_token or self.selected_manifest != target_manifest:
+                return
             self.current_plan = plan
             detail_view = self.query_one("#detail-view", Markdown)
 
             md = "## Installation Plan Preview (Dry-Run)\n\n"
-            md += f"**Target Agent:** {self.selected_agent.name}\n"
-            md += f"**Scope:** {self.selected_scope.value}\n\n"
+            md += f"**Target Agent:** {target_agent.name}\n"
+            md += f"**Scope:** {target_scope.value}\n\n"
             md += "### Operations to be executed:\n"
             for op in plan.planned_operations:
                 md += f"- ✓ {op.description}\n"
             md += "\n*No changes were made to host system state.*\n"
             detail_view.update(md)
-            self.notify(f"Generated dry-run plan for {self.selected_manifest.name}.", severity="information")
+            self.notify(f"Generated dry-run plan for {target_manifest.name}.", severity="information")
         except Exception as exc:
+            if token != self._preview_token or self.selected_manifest != target_manifest:
+                return
             detail_view = self.query_one("#detail-view", Markdown)
             detail_view.update(f"## Plan Preview Error\n\n❌ {exc}")
             self.notify(f"Plan error: {exc}", severity="error")
@@ -662,24 +707,36 @@ class AIAddonsTUIApp(App[None]):
 
         mcp_spec = self.selected_manifest.handler_spec.mcp
         env_vars_map = {v.name: v for v in mcp_spec.env_vars} if mcp_spec else {}
+        required_vars = [v for v in mcp_spec.env_vars if v.required] if mcp_spec else []
 
-        for name, inp in self.secret_inputs.items():
-            val = inp.value.strip()
+        for req_spec in required_vars:
+            inp = self.secret_inputs.get(req_spec.name)
+            val = inp.value.strip() if inp else ""
             if not val:
                 detail_view.update(
-                    f"## Installation Error\n\n❌ Secret '{name}' is required.\n\n"
+                    f"## Installation Error\n\n❌ Secret '{req_spec.name}' is required.\n\n"
                     "No value was entered — please fill in the field and try again."
                 )
-                self.notify(f"Secret '{name}' is required. No value was entered.", severity="error")
+                self.notify(f"Secret '{req_spec.name}' is required. No value was entered.", severity="error")
                 return
 
-            spec = env_vars_map.get(name)
-            if spec and not force_secrets:
-                warnings = validate_secret_format(val, spec)
+            if not force_secrets:
+                warnings = validate_secret_format(val, req_spec)
                 if warnings:
-                    all_warnings.append(f"{name}: " + ", ".join(warnings))
+                    all_warnings.append(f"{req_spec.name}: " + ", ".join(warnings))
 
-            secret_map[name] = val
+            secret_map[req_spec.name] = val
+
+        for name, inp in self.secret_inputs.items():
+            if name not in secret_map and name in env_vars_map:
+                val = inp.value.strip()
+                if val:
+                    spec = env_vars_map[name]
+                    if not force_secrets:
+                        warnings = validate_secret_format(val, spec)
+                        if warnings:
+                            all_warnings.append(f"{name}: " + ", ".join(warnings))
+                    secret_map[name] = val
 
         if all_warnings and not force_secrets:
             def handle_warning_result(confirmed: bool | None) -> None:
