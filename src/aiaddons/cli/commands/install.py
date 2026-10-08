@@ -175,6 +175,25 @@ def _handle_error(
     raise typer.Exit(code=exit_code)
 
 
+INSTALL_HELP_EPILOG = """
+Examples:
+  # Install a single add-on
+  aiaddons install github-mcp
+
+  # Preview the installation plan without making changes
+  aiaddons install github-mcp --dry-run
+
+  # Install for a specific agent and global scope
+  aiaddons install context7-mcp --agent claude-code --scope global
+
+  # Install multiple add-ons in one command
+  aiaddons install github-mcp caveman
+
+  # Install from a stack file
+  aiaddons install --file registry/stacks/dev-starter-stack.yaml
+"""
+
+
 def install_command(
     addon_ids: list[str] = typer.Argument(
         None,
@@ -224,9 +243,7 @@ def install_command(
 ) -> None:
     """Install one or more add-ons or output a dry-run installation plan with safety verification.
 
-    Required secrets (e.g. API tokens) are prompted interactively with masked input
-    supporting Ctrl+V clipboard pasting on Windows. Alternatively, you can pre-set
-    secrets via environment variables before running:
+    Required secrets (e.g. API tokens) are prompted interactively with masked input supporting Ctrl+V clipboard pasting on Windows. Alternatively, you can pre-set secrets via environment variables before running:
       PowerShell: $env:TOKEN_NAME="your_token"
       Bash/Zsh:   export TOKEN_NAME="your_token"
     """

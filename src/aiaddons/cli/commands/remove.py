@@ -156,6 +156,22 @@ def synthesize_manifest_from_record(record: InstalledAddonRecord) -> Integration
 from aiaddons.core.drift import detect_installation_drift
 
 
+REMOVE_HELP_EPILOG = """
+Examples:
+  # Remove an installed add-on
+  aiaddons remove github-mcp
+
+  # Preview removal without making changes
+  aiaddons remove github-mcp --dry-run
+
+  # Remove from a specific agent and scope
+  aiaddons remove github-mcp --agent claude-code --scope workspace
+
+  # Force removal even if drift is detected
+  aiaddons remove github-mcp --force
+"""
+
+
 def remove_command(
     addon_id: str = typer.Argument(..., help="ID of the add-on to remove"),
     scope: str | None = typer.Option(

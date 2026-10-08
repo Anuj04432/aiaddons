@@ -127,6 +127,22 @@ def _handle_update_error(
     raise typer.Exit(code=exit_code)
 
 
+UPDATE_HELP_EPILOG = """
+Examples:
+  # Update a single add-on to the latest version
+  aiaddons update github-mcp
+
+  # Update an add-on to a specific pinned version
+  aiaddons update github-mcp --version 2025.4.8
+
+  # Preview updating all installed add-ons
+  aiaddons update --all --dry-run
+
+  # Update all installed add-ons non-interactively
+  aiaddons update --all --yes
+"""
+
+
 def update_command(
     addon_id: str | None = typer.Argument(
         None,

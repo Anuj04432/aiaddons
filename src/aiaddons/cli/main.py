@@ -7,7 +7,7 @@ from aiaddons import __version__
 from aiaddons.cli.commands.agents import agents_command
 from aiaddons.cli.commands.compatibility import check_command
 from aiaddons.cli.commands.doctor import doctor_command
-from aiaddons.cli.commands.install import install_command
+from aiaddons.cli.commands.install import INSTALL_HELP_EPILOG, install_command
 from aiaddons.cli.commands.registry import (
     info_command,
     list_command,
@@ -15,10 +15,10 @@ from aiaddons.cli.commands.registry import (
     registry_update_command,
     search_command,
 )
-from aiaddons.cli.commands.remove import remove_command
+from aiaddons.cli.commands.remove import REMOVE_HELP_EPILOG, remove_command
 from aiaddons.cli.commands.sync import sync_command
 from aiaddons.cli.commands.tui import tui_command
-from aiaddons.cli.commands.update import update_command
+from aiaddons.cli.commands.update import UPDATE_HELP_EPILOG, update_command
 
 app = typer.Typer(
     name="aiaddons",
@@ -34,10 +34,10 @@ app.command(name="list")(list_command)
 app.command(name="search")(search_command)
 app.command(name="info")(info_command)
 app.command(name="check")(check_command)
-app.command(name="install")(install_command)
-app.command(name="update")(update_command)
+app.command(name="install", epilog=INSTALL_HELP_EPILOG)(install_command)
+app.command(name="update", epilog=UPDATE_HELP_EPILOG)(update_command)
 app.command(name="sync")(sync_command)
-app.command(name="remove")(remove_command)
+app.command(name="remove", epilog=REMOVE_HELP_EPILOG)(remove_command)
 app.command(name="doctor")(doctor_command)
 app.command(name="tui")(tui_command)
 
