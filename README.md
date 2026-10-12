@@ -108,13 +108,13 @@ Run `aiaddons <command> --help` for command options and flags.
 
 ## Registry
 
-The built-in registry currently provides **31 verified integrations** across three formats:
+The built-in registry currently provides **35 verified integrations** across three formats:
 
-- **Model Context Protocol (MCP) servers** (13): Data connectors and external tools including `github-mcp`, `postgres-mcp`, `sentry-mcp`, `stripe-mcp`, `supabase-mcp`, `brave-search-mcp`, `playwright-mcp`, and `context7-mcp`.
+- **Model Context Protocol (MCP) servers** (17): Data connectors and external tools including `github-mcp`, `postgres-mcp`, `sentry-mcp`, `stripe-mcp`, `supabase-mcp`, `brave-search-mcp`, `playwright-mcp`, `context7-mcp`, `chrome-devtools-mcp`, `heroku-mcp`, `browserstack-mcp`, and `qase-mcp`.
 - **Agent skills** (15): Prompt templates, instruction sets, and workflows centered around `SKILL.md` specifications, including `caveman`, `vibesec-skill`, `skill-creator`, and `superpowers-*`.
 - **Composite plugins** (3): Multi-component packages combining MCP servers, skills, and CLI tools under unified configuration boundaries (`superpowers`, `ponytail`, `python-lint-plugin`).
 
-The registry also includes preconfigured team stacks (`registry/stacks/dev-starter-stack.yaml`, `registry/stacks/agent-behavior-stack.yaml`) for zero-touch project onboarding.
+The registry also includes preconfigured team stacks (`dev-starter-stack.yaml`, `agent-behavior-stack.yaml`) for zero-touch project onboarding.
 
 Explore available add-ons using the CLI or the interactive terminal user interface:
 
