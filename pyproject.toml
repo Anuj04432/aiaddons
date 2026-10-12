@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aiaddons"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI Add-ons Manager - Package & Integration Manager for AI Agents"
 license = "MIT"
 readme = "README.md"
@@ -39,9 +39,11 @@ packages = ["src/aiaddons"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "registry/addons" = "aiaddons/registry/addons"
+"registry/stacks" = "aiaddons/registry/stacks"
 
 [tool.hatch.build.targets.sdist.force-include]
 "registry/addons" = "registry/addons"
+"registry/stacks" = "registry/stacks"
 
 [tool.pytest.ini_options]
 minversion = "8.0"

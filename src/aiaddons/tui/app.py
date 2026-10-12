@@ -37,7 +37,7 @@ from aiaddons.core.installer.models import (
 )
 from aiaddons.core.models.agent import AgentCapability, AgentDetectionResult, Scope
 from aiaddons.core.models.manifest import IntegrationManifest, IntegrationType
-from aiaddons.core.models.stack import AddonStack
+from aiaddons.core.models.stack import AddonStack, find_stacks_dir
 from aiaddons.core.secrets.resolver import mask_secret_preview, validate_secret_format
 from aiaddons.core.update.engine import UpdateEngine, is_newer_version
 from aiaddons.core.update.models import UpdatePlan
@@ -285,24 +285,7 @@ class AIAddonsTUIApp(App[None]):
 
     def _find_stacks_dir(self) -> Path | None:
         """Locate registry stacks directory."""
-        candidates: list[Path] = []
-        if self.registry_dir:
-            candidates.extend([
-                self.registry_dir / "stacks",
-                self.registry_dir.parent / "stacks",
-            ])
-        cwd = self.workspace_dir
-        candidates.extend([
-            cwd / "registry" / "stacks",
-            Path.cwd() / "registry" / "stacks",
-        ])
-        pkg_file = Path(__file__).resolve()
-        for parent in pkg_file.parents:
-            candidates.extend([parent / "registry" / "stacks", parent / "stacks"])
-        for cand in candidates:
-            if cand.exists() and cand.is_dir():
-                return cand
-        return None
+        return find_stacks_dir(self.registry_dir)
 
     def _load_stacks(self) -> None:
         """Discover and load stacks from the registry stacks directory."""

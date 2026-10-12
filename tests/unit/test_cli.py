@@ -12,28 +12,28 @@ runner = CliRunner()
 
 def test_package_version() -> None:
     """Test package version variable."""
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.2.0"
 
 
 def test_cli_version_flag() -> None:
     """Test `aiaddons --version` flag."""
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "aiaddons version 0.1.0" in result.stdout
+    assert "aiaddons version 0.2.0" in result.stdout
 
 
 def test_cli_version_short_flag() -> None:
     """Test `aiaddons -v` short flag."""
     result = runner.invoke(app, ["-v"])
     assert result.exit_code == 0
-    assert "aiaddons version 0.1.0" in result.stdout
+    assert "aiaddons version 0.2.0" in result.stdout
 
 
 def test_cli_version_subcommand() -> None:
     """Test `aiaddons version` subcommand."""
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0
-    assert "aiaddons version 0.1.0" in result.stdout
+    assert "aiaddons version 0.2.0" in result.stdout
 
 
 def test_cli_main_no_args() -> None:

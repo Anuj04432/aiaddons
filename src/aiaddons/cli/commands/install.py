@@ -190,7 +190,7 @@ Examples:
   aiaddons install github-mcp caveman
 
   # Install from a stack file
-  aiaddons install --file registry/stacks/dev-starter-stack.yaml
+  aiaddons install --file dev-starter-stack.yaml
 """
 
 
